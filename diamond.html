@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#1c1c1c">
+<title>Алмаз</title>
+<style>
+  :root { --gap: clamp(8px, 2vmin, 16px); }
+  html, body {
+    margin: 0; height: 100%; background: #1c1c1c; overflow: hidden;
+    overscroll-behavior: none; touch-action: manipulation;
+    -webkit-user-select: none; user-select: none;
+  }
+  body {
+    height: 100vh; height: 100dvh;
+    display: flex; flex-direction: column; box-sizing: border-box;
+    font-family: Arial, Helvetica, sans-serif;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  #view { flex: 1; min-height: 0; position: relative; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+  #bar {
+    display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap);
+    padding: var(--gap); width: 100%; max-width: 960px;
+    margin: 0 auto; box-sizing: border-box;
+  }
+  button {
+    background: #000; color: #fff; border: none; border-radius: 12px;
+    padding: clamp(10px, 2.4vmin, 20px) 6px;
+    font-size: clamp(14px, 2.2vmin + 6px, 22px); font-weight: bold;
+    cursor: pointer; -webkit-tap-highlight-color: transparent;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  button:active { background: #2a2a2a; }
+  @media (hover: hover) { button:hover { background: #1a1a1a; } }
+
+  /* планшеты, ноутбуки, ПК: все четыре кнопки в один ряд */
+  @media (min-width: 600px) { #bar { grid-template-columns: repeat(4, 1fr); } }
+  /* телефон в горизонтальном положении: низкие кнопки в один ряд */
+  @media (max-height: 480px) {
+    #bar { grid-template-columns: repeat(4, 1fr); }
+    button { padding: 8px 4px; font-size: 14px; }
+  }
+</style>
+</head>
+<body>
+<div id="view"><canvas id="c"></canvas></div>
+<div id="bar">
+  <button id="pause" title="Пробел">Пауза</button>
+  <button id="restart" title="R">Перезапуск</button>
+  <button id="dir" title="← →">Направление</button>
+  <button id="speed" title="↑ ↓">Скорость: x1</button>
+</div>
+
+<script>
+// ---------- Настройки ----------
+const BASE_COLOR = [45, 225, 215];   // бирюзовый цвет алмаза
+const SPAWN_TIME = 1.4;              // длительность появления (сек)
+const SPEEDS = [1, 2, 4];            // варианты скорости
+const DETAIL = 44;                   // детализация: символов по короткой стороне
+const MAX_CELLS = 9000;              // потолок числа символов (для слабых устройств)
+const RAMP = ".:-=+*#%@";            // от тёмного к светлому
+
+// ---------- Геометрия алмаза ----------
+const SEG = 8;
+const vertices = [];
+const faces = [];
+for (let i = 0; i < SEG; i++) {
+  const a = 2 * Math.PI * i / SEG + Math.PI / SEG;
+  vertices.push([0.5 * Math.cos(a), -0.55, 0.5 * Math.sin(a)]);
+}
+for (let i = 0; i < SEG; i++) {
+  const a = 2 * Math.PI * i / SEG + Math.PI / SEG;
+  vertices.push([Math.cos(a), 0, Math.sin(a)]);
+}
+vertices.push([0, 1.35, 0]);
+const BOTTOM = vertices.length - 1;
+faces.push([...Array(SEG).keys()]);
+for (let i = 0; i < SEG; i++) {
+  const j = (i + 1) % SEG;
+  faces.push([i, j, SEG + j, SEG + i]);
+  faces.push([SEG + i, SEG + j, BOTTOM]);
+}
+const CENTER_Y = 0.25;
+let LIGHT = [-0.35, -0.55, -0.75];
+const ln = Math.hypot(...LIGHT);
+LIGHT = LIGHT.map(v => v / ln);
+
+const easeOutBack = t => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+
+// ---------- Состояние ----------
+const state = { angle: 0, spawn: 0, paused: false, dir: 1, speed: 0 };
+
+const view = document.getElementById('view');
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const off = document.createElement('canvas');
+const octx = off.getContext('2d');
+const small = document.createElement('canvas');
+const sctx = small.getContext('2d', { willReadFrequently: true });
+
+let W = 1, H = 1, COLS = 40, ROWS = 30, cw = 10, ch = 17, F = 100, cx0 = 0, cy0 = 0;
+
+// Подгоняет сетку символов под любой экран: телефон, планшет, ноутбук, ПК
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.max(1, Math.floor(view.clientWidth * dpr));
+  H = Math.max(1, Math.floor(view.clientHeight * dpr));
+  canvas.width = W;
+  canvas.height = H;
+
+  let unit = Math.min(W, H / 1.7) / DETAIL;          // ширина одной клетки
+  unit = Math.max(unit, 4 * dpr);                    // не мельче 4 px
+  while ((W / unit) * (H / (unit * 1.7)) > MAX_CELLS) unit *= 1.08;
+
+  COLS = Math.max(20, Math.round(W / unit));
+  ROWS = Math.max(12, Math.round(H / (unit * 1.7)));
+  cw = W / COLS;
+  ch = H / ROWS;
+
+  off.width = COLS * 4;
+  off.height = Math.max(4, Math.round(H / W * off.width));
+  small.width = COLS;
+  small.height = ROWS;
+
+  F = Math.min(off.width, off.height) * 0.32;
+  cx0 = off.width / 2;
+  cy0 = off.height * 0.48;
+}
+if (window.ResizeObserver) new ResizeObserver(resize).observe(view);
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 150));
+resize();
+
+function project(p, scale, yoff) {
+  const d = 4.5, f = F * scale, k = d / (d + p[2]);
+  return [cx0 + p[0] * f * k, cy0 + (p[1] + yoff) * f * k];
+}
+
+function renderDiamond() {
+  octx.fillStyle = '#000';
+  octx.fillRect(0, 0, off.width, off.height);
+
+  let scale = 1, yoff = 0;
+  if (state.spawn < 1) {
+    scale = Math.max(0.001, easeOutBack(state.spawn));
+    yoff = -(1 - easeOutCubic(state.spawn)) * 1.8;
+  } else {
+    yoff = 0.04 * Math.sin(state.angle * 1.5);
+  }
+
+  const sa = Math.sin(state.angle), ca = Math.cos(state.angle);
+  const tilt = 0.35, st = Math.sin(tilt), ct = Math.cos(tilt);
+
+  const rot = vertices.map(([x, y, z]) => {
+    const x1 = x * ca + z * sa;
+    const z1 = -x * sa + z * ca;
+    return [x1, y * ct - z1 * st, y * st + z1 * ct];
+  });
+  const center = [0, CENTER_Y * ct, CENTER_Y * st];
+
+  const polys = faces.map(face => {
+    const pts = face.map(i => rot[i]);
+    const a = [0, 1, 2].map(k => pts[1][k] - pts[0][k]);
+    const b = [0, 1, 2].map(k => pts[2][k] - pts[0][k]);
+    let n = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    const nl = Math.hypot(...n) || 1;
+    n = n.map(v => v / nl);
+    const mid = [0, 1, 2].map(k => pts.reduce((s, p) => s + p[k], 0) / pts.length);
+    const out = [0, 1, 2].map(k => mid[k] - center[k]);
+    if (n[0] * out[0] + n[1] * out[1] + n[2] * out[2] < 0) n = n.map(v => -v);
+    return { z: mid[2], pts, n };
+  }).sort((p, q) => q.z - p.z);
+
+  for (const { pts, n } of polys) {
+    if (n[2] > 0.05) continue;
+    const light = n[0] * LIGHT[0] + n[1] * LIGHT[1] + n[2] * LIGHT[2];
+    const br = 0.35 + 0.65 * Math.max(0, light);
+    const v = Math.min(255, Math.floor(255 * br));
+    octx.fillStyle = `rgb(${v},${v},${v})`;
+    octx.beginPath();
+    pts.forEach((p, i) => {
+      const [x, y] = project(p, scale, yoff);
+      i ? octx.lineTo(x, y) : octx.moveTo(x, y);
+    });
+    octx.closePath();
+    octx.fill();
+  }
+}
+
+// цвета символов по уровням яркости
+const glyphColors = [...RAMP].map((_, idx) => {
+  const lvl = 0.40 + 0.60 * idx / (RAMP.length - 1);
+  const glow = Math.max(0, lvl - 0.85) * 4;
+  return 'rgb(' + BASE_COLOR.map(c => Math.min(255, Math.floor(c * lvl + 255 * glow))).join(',') + ')';
+});
+const buckets = RAMP.split('').map(() => []);
+
+function draw() {
+  renderDiamond();
+  sctx.imageSmoothingEnabled = true;
+  sctx.imageSmoothingQuality = 'high';
+  sctx.clearRect(0, 0, COLS, ROWS);
+  sctx.drawImage(off, 0, 0, COLS, ROWS);
+  const data = sctx.getImageData(0, 0, COLS, ROWS).data;
+
+  ctx.fillStyle = '#1c1c1c';
+  ctx.fillRect(0, 0, W, H);
+  ctx.font = `bold ${Math.min(ch * 1.05, cw * 1.65)}px monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  const n = RAMP.length;
+  buckets.forEach(b => { b.length = 0; });
+  for (let ry = 0; ry < ROWS; ry++) {
+    for (let cx = 0; cx < COLS; cx++) {
+      const r = data[(ry * COLS + cx) * 4];
+      if (r < 20) continue;
+      let idx = Math.floor((r / 255 - 0.2) / 0.8 * n);
+      idx = idx < 0 ? 0 : (idx >= n ? n - 1 : idx);
+      buckets[idx].push(cx * cw + cw / 2, ry * ch + ch / 2);
+    }
+  }
+  // рисуем сразу всё одного цвета: так быстрее на слабых телефонах
+  for (let i = 0; i < n; i++) {
+    const b = buckets[i];
+    if (!b.length) continue;
+    ctx.fillStyle = glyphColors[i];
+    const c = RAMP[i];
+    for (let k = 0; k < b.length; k += 2) ctx.fillText(c, b[k], b[k + 1]);
+  }
+}
+
+// ---------- Управление ----------
+const btnPause = document.getElementById('pause');
+const btnSpeed = document.getElementById('speed');
+
+function togglePause() {
+  state.paused = !state.paused;
+  btnPause.textContent = state.paused ? 'Продолжить' : 'Пауза';
+}
+function restart() {
+  state.angle = 0; state.spawn = 0; state.paused = false;
+  btnPause.textContent = 'Пауза';
+}
+function toggleDir() { state.dir *= -1; }
+function cycleSpeed() {
+  state.speed = (state.speed + 1) % SPEEDS.length;
+  btnSpeed.textContent = 'Скорость: x' + SPEEDS[state.speed];
+}
+
+btnPause.onclick = togglePause;
+document.getElementById('restart').onclick = restart;
+document.getElementById('dir').onclick = toggleDir;
+btnSpeed.onclick = cycleSpeed;
+
+// клавиатура для ПК и ноутбука
+window.addEventListener('keydown', e => {
+  const k = e.key;
+  const map = {
+    ' ': togglePause, 'p': togglePause, 'P': togglePause,
+    'r': restart, 'R': restart, 'к': restart, 'К': restart,
+    'ArrowLeft': toggleDir, 'ArrowRight': toggleDir,
+    'ArrowUp': cycleSpeed, 'ArrowDown': cycleSpeed
+  };
+  if (map[k]) {
+    e.preventDefault();
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    map[k]();
+  }
+});
+
+// ---------- Цикл ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  if (!state.paused) {
+    state.angle += state.dir * SPEEDS[state.speed] * 1.2 * dt;
+    if (state.spawn < 1) state.spawn = Math.min(1, state.spawn + dt / SPAWN_TIME);
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
